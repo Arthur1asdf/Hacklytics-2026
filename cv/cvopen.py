@@ -25,6 +25,30 @@ DEBUG_MODE = False  # Print all detections for debugging
 # Minimum contour area to avoid noise (adjust if getting too many/few detections)
 MIN_CONTOUR_AREA = 15  # Very low to catch all limb sections
 
+# Occlusion handling / temporal stability
+MISSING_GRACE_FRAMES = 6  # Require several consecutive misses before "missing"
+MIN_MODEL_VISIBLE_RATIO = 0.03  # If too little model color is visible, treat as occluded
+ZONE_MIN_COVERAGE_RATIO = 0.045  # Fallback zone must have enough colored pixels to trust state
+CORE_LIMBS = {'chest', 'torso'}  # Only these get relaxed dark-red handling
+ALL_LIMBS = ['head', 'chest', 'torso', 'left_arm', 'right_arm', 'left_leg', 'right_leg']
+CONTOUR_CONF_FALLBACK = 0.55  # Generic contour fallback threshold
+RED_CONTOUR_CONF_FALLBACK = 0.40  # Allow red through with lower contour confidence
+RED_IMMEDIATE_CONF = 0.48  # If current-frame red confidence exceeds this, show red immediately
+RED_LATCH_FRAMES = 2  # Keep immediate red visible briefly to avoid flicker
+TEMPLATE_MASK_MIN_PIXELS_RATIO = 0.10  # Required colored coverage within each traced limb mask
+
+# Fallback limb zones (x1, y1, x2, y2) normalized to ROI dimensions
+LIMB_ZONES = {
+    'head': (0.30, 0.00, 0.70, 0.25),
+    'chest': (0.30, 0.20, 0.70, 0.40),
+    'torso': (0.30, 0.40, 0.70, 0.60),
+    # Keep arm zones tighter/outside center body so missing-arm fallback is less prone to torso bleed.
+    'left_arm': (0.00, 0.15, 0.22, 0.60),
+    'right_arm': (0.78, 0.15, 1.00, 0.60),
+    'left_leg': (0.20, 0.60, 0.50, 1.00),
+    'right_leg': (0.50, 0.60, 0.80, 1.00),
+}
+
 def identify_limb(contour, roi_width, roi_height):
     """
     Identify which limb a contour represents based on its position and shape
@@ -81,13 +105,21 @@ def identify_limb(contour, roi_width, roi_height):
     
     return "unknown"
 
-def detect_color_state(roi_section, mask=None):
+def analyze_color_state(roi_section, mask=None, min_colored_pixels=3, profile='strict'):
     """
     Detect if the limb is green (healthy), yellow (warning), or red (critical)
-    Returns: 'green', 'yellow', 'red', or 'unknown'
+    Returns dict with state/confidence/coverage metrics.
     """
     if roi_section.size == 0:
-        return 'unknown'
+        return {
+            'state': 'unknown',
+            'confidence': 0.0,
+            'coverage_ratio': 0.0,
+            'red_pct': 0.0,
+            'yellow_pct': 0.0,
+            'green_pct': 0.0,
+            'total_colored': 0,
+        }
     
     # Convert to HSV for better color detection
     hsv = cv2.cvtColor(roi_section, cv2.COLOR_BGR2HSV)
@@ -107,14 +139,23 @@ def detect_color_state(roi_section, mask=None):
     yellow_lower = np.array([18, 75, 95])
     yellow_upper = np.array([44, 255, 255])
     
-    # Orange range (hue 5-17, VERY HIGH saturation/value)
-    orange_lower = np.array([5, 75, 95])
-    orange_upper = np.array([17, 255, 255])
-    
-    # Pure red range (hue 0-5 and 170-180, VERY HIGH saturation/value)
-    red_lower1 = np.array([0, 75, 95])
+    if profile == 'core_relaxed':
+        # For chest/torso only: include darker warm reds.
+        orange_lower = np.array([5, 65, 60])
+        orange_upper = np.array([21, 255, 255])
+        red_lower1 = np.array([0, 65, 60])
+        red_lower2 = np.array([170, 65, 60])
+        red_soft_bias = True
+    else:
+        # Default strict profile for head/arms/legs to avoid environment-driven false red.
+        orange_lower = np.array([5, 80, 100])
+        orange_upper = np.array([18, 255, 255])
+        red_lower1 = np.array([0, 80, 100])
+        red_lower2 = np.array([170, 80, 100])
+        red_soft_bias = False
+
+    # Pure red range
     red_upper1 = np.array([5, 255, 255])
-    red_lower2 = np.array([170, 75, 95])
     red_upper2 = np.array([180, 255, 255])
     
     # Create masks
@@ -135,9 +176,20 @@ def detect_color_state(roi_section, mask=None):
     
     total_colored = green_pixels + yellow_pixels + red_pixels
     
-    # Need minimum pixels to make a determination - very low threshold
-    if total_colored < 3:
-        return 'unknown'
+    total_pixels = max(int(roi_section.shape[0] * roi_section.shape[1]), 1)
+    coverage_ratio = total_colored / total_pixels
+
+    # Need minimum pixels to make a determination
+    if total_colored < min_colored_pixels:
+        return {
+            'state': 'unknown',
+            'confidence': 0.0,
+            'coverage_ratio': coverage_ratio,
+            'red_pct': 0.0,
+            'yellow_pct': 0.0,
+            'green_pct': 0.0,
+            'total_colored': total_colored,
+        }
     
     # Determine dominant color with clear priority
     # Check each color independently with very low thresholds (10%)
@@ -147,22 +199,130 @@ def detect_color_state(roi_section, mask=None):
     yellow_pct = yellow_pixels / total
     green_pct = green_pixels / total
     
-    # Return the dominant color (must be >10% to be considered)
-    if red_pct > 0.10:
-        return 'red'
+    # Soft red bias only for chest/torso profile
+    state = None
+    if red_soft_bias and red_pct >= 0.08 and red_pct >= (yellow_pct * 0.75):
+        state = 'red'
+    elif red_pct > (0.10 if red_soft_bias else 0.14):
+        state = 'red'
     elif yellow_pct > 0.10:
-        return 'yellow'
+        state = 'yellow'
     elif green_pct > 0.10:
-        return 'green'
+        state = 'green'
     else:
-        # If no color is dominant enough, pick the highest
+        # If no color is dominant enough, pick the highest.
         max_pct = max(red_pct, yellow_pct, green_pct)
         if max_pct == red_pct:
-            return 'red'
+            state = 'red'
         elif max_pct == yellow_pct:
-            return 'yellow'
+            state = 'yellow'
         else:
-            return 'green'
+            state = 'green'
+
+    dominant_pct = max(red_pct, yellow_pct, green_pct)
+    pixel_strength = min(1.0, total_colored / max(float(min_colored_pixels * 2), 1.0))
+    confidence = float(np.clip((0.65 * dominant_pct) + (0.35 * pixel_strength), 0.0, 1.0))
+
+    return {
+        'state': state,
+        'confidence': confidence,
+        'coverage_ratio': coverage_ratio,
+        'red_pct': red_pct,
+        'yellow_pct': yellow_pct,
+        'green_pct': green_pct,
+        'total_colored': total_colored,
+    }
+
+def detect_color_state(roi_section, mask=None, min_colored_pixels=3, profile='strict'):
+    """Backwards-compatible state-only wrapper."""
+    return analyze_color_state(
+        roi_section,
+        mask=mask,
+        min_colored_pixels=min_colored_pixels,
+        profile=profile,
+    )['state']
+
+def get_limb_zone_bounds(limb_name, roi_w, roi_h):
+    """Return integer zone bounds (x1, y1, x2, y2) for a limb in ROI coordinates."""
+    if limb_name not in LIMB_ZONES:
+        return None
+
+    x1n, y1n, x2n, y2n = LIMB_ZONES[limb_name]
+    x1 = max(0, min(roi_w - 1, int(x1n * roi_w)))
+    x2 = max(1, min(roi_w, int(x2n * roi_w)))
+    y1 = max(0, min(roi_h - 1, int(y1n * roi_h)))
+    y2 = max(1, min(roi_h, int(y2n * roi_h)))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+def get_limb_zone_analysis(roi_frame, color_mask, limb_name):
+    """
+    Fallback color detection in a fixed zone for a limb.
+    Returns: 'green'/'yellow'/'red'/'unknown'
+    """
+    h, w = roi_frame.shape[:2]
+    bounds = get_limb_zone_bounds(limb_name, w, h)
+    if bounds is None:
+        return {
+            'state': 'unknown',
+            'confidence': 0.0,
+            'coverage_ratio': 0.0,
+            'min_zone_pixels': 0,
+        }
+    x1, y1, x2, y2 = bounds
+
+    zone_roi = roi_frame[y1:y2, x1:x2]
+    zone_mask = color_mask[y1:y2, x1:x2]
+    zone_area = zone_mask.shape[0] * zone_mask.shape[1]
+    min_zone_pixels = max(3, int(zone_area * ZONE_MIN_COVERAGE_RATIO))
+    profile = 'core_relaxed' if limb_name in CORE_LIMBS else 'strict'
+    analysis = analyze_color_state(
+        zone_roi,
+        zone_mask,
+        min_colored_pixels=min_zone_pixels,
+        profile=profile,
+    )
+    analysis['min_zone_pixels'] = min_zone_pixels
+    return analysis
+
+def build_limb_template_masks(roi_w, roi_h):
+    """
+    Build traced limb masks so detection samples only model silhouette paths,
+    reducing background bleed from nearby environment.
+    """
+    masks = {name: np.zeros((roi_h, roi_w), dtype=np.uint8) for name in ALL_LIMBS}
+
+    def pt(xn, yn):
+        return (int(xn * roi_w), int(yn * roi_h))
+
+    line_thick = max(2, int(min(roi_w, roi_h) * 0.05))
+    leg_thick = max(2, int(min(roi_w, roi_h) * 0.045))
+    arm_thick = max(2, int(min(roi_w, roi_h) * 0.045))
+
+    # Head ring
+    cv2.circle(masks['head'], pt(0.50, 0.10), max(3, int(min(roi_w, roi_h) * 0.10)), 255, thickness=line_thick)
+
+    # Chest and torso are filled center regions
+    chest_poly = np.array([pt(0.36, 0.22), pt(0.64, 0.22), pt(0.66, 0.41), pt(0.34, 0.41)], dtype=np.int32)
+    torso_poly = np.array([pt(0.38, 0.40), pt(0.62, 0.40), pt(0.60, 0.58), pt(0.40, 0.58)], dtype=np.int32)
+    cv2.fillConvexPoly(masks['chest'], chest_poly, 255)
+    cv2.fillConvexPoly(masks['torso'], torso_poly, 255)
+
+    # Arms as traced curves
+    left_arm_pts = np.array([pt(0.32, 0.23), pt(0.24, 0.34), pt(0.20, 0.48), pt(0.24, 0.60)], dtype=np.int32)
+    right_arm_pts = np.array([pt(0.68, 0.23), pt(0.76, 0.34), pt(0.80, 0.48), pt(0.76, 0.60)], dtype=np.int32)
+    cv2.polylines(masks['left_arm'], [left_arm_pts], False, 255, thickness=arm_thick)
+    cv2.polylines(masks['right_arm'], [right_arm_pts], False, 255, thickness=arm_thick)
+
+    # Legs as traced lines
+    left_leg_pts = np.array([pt(0.45, 0.58), pt(0.38, 0.76), pt(0.32, 0.93)], dtype=np.int32)
+    right_leg_pts = np.array([pt(0.55, 0.58), pt(0.62, 0.76), pt(0.68, 0.93)], dtype=np.int32)
+    cv2.polylines(masks['left_leg'], [left_leg_pts], False, 255, thickness=leg_thick)
+    cv2.polylines(masks['right_leg'], [right_leg_pts], False, 255, thickness=leg_thick)
+
+    return masks
 
 def main():
     """
@@ -204,11 +364,7 @@ def main():
     print(f"Screen resolution: {monitor['width']}x{monitor['height']}")
     print("Monitoring started...\n")
     
-    # Store previous states to avoid spam
-    previous_states = {}
-    
     # Track all expected limbs
-    ALL_LIMBS = ['head', 'chest', 'torso', 'left_arm', 'right_arm', 'left_leg', 'right_leg']
     limbs_ever_seen = set()
     
     # Temporal smoothing - require seeing same state multiple times before changing
@@ -216,9 +372,12 @@ def main():
     HISTORY_SIZE = 4  # Keep last 4 frames
     DAMAGE_CONFIDENCE = 2  # Need 2/4 frames for red/yellow (fast response to damage)
     SAFE_CONFIDENCE = 3  # Need 3/4 frames for green/missing (avoid false positives)
+    consecutive_absent = {limb: 0 for limb in ALL_LIMBS}
+    red_latch_remaining = {limb: 0 for limb in ALL_LIMBS}
     
     # Debug image flag
     debug_image_saved = False
+    template_masks = build_limb_template_masks(ROI_WIDTH, ROI_HEIGHT)
     
     try:
         while True:
@@ -243,7 +402,7 @@ def main():
             # Yellow player parts (ONLY bright saturated yellow)
             yellow_mask = cv2.inRange(hsv_roi, np.array([18, 80, 100]), np.array([44, 255, 255]))
             
-            # Orange/Red player parts (ONLY bright saturated red/orange)
+            # Orange/Red player parts (strict mask for robust contour extraction in moving environments)
             orange_mask = cv2.inRange(hsv_roi, np.array([5, 80, 100]), np.array([18, 255, 255]))
             red_mask1 = cv2.inRange(hsv_roi, np.array([0, 80, 100]), np.array([5, 255, 255]))
             red_mask2 = cv2.inRange(hsv_roi, np.array([170, 80, 100]), np.array([180, 255, 255]))
@@ -262,6 +421,7 @@ def main():
             
             # Find contours
             contours, _ = cv2.findContours(color_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            model_visible_ratio = cv2.countNonZero(color_mask) / float(ROI_WIDTH * ROI_HEIGHT)
             
             # Save debug images on first frame
             if SAVE_DEBUG_IMAGE and not debug_image_saved:
@@ -280,55 +440,38 @@ def main():
                             limb_name = identify_limb(contour, ROI_WIDTH, ROI_HEIGHT)
                             cv2.putText(debug_contours, limb_name, (cx-10, cy), 
                                        cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 0), 1)
+                for limb_name in ALL_LIMBS:
+                    contours_mask, _ = cv2.findContours(template_masks[limb_name], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                    cv2.drawContours(debug_contours, contours_mask, -1, (255, 200, 0), 1)
                 cv2.imwrite('debug_contours.png', debug_contours)
                 
                 print(f"✓ Saved debug images: debug_captured_area.png, debug_mask.png, debug_contours.png")
                 print(f"  Check these to see what is being detected\n")
                 debug_image_saved = True
             
-            # Check each significant contour
+            # Primary traced-mask detection for all limbs
             current_states = {}
-            if DEBUG_MODE and len(contours) > 0:
-                print(f"\nFound {len(contours)} contours in ROI (ROI size: {ROI_WIDTH}x{ROI_HEIGHT})")
-            
-            for contour in contours:
-                area = cv2.contourArea(contour)
-                
-                if area < MIN_CONTOUR_AREA:
-                    continue
-                
-                # Identify which limb this contour represents
-                limb_name = identify_limb(contour, ROI_WIDTH, ROI_HEIGHT)
-                
-                if limb_name == "unknown":
-                    continue
-                
-                # Track that we've seen this limb at least once
-                limbs_ever_seen.add(limb_name)
-                
-                # Create a mask for this specific contour
-                limb_mask = np.zeros(roi_frame.shape[:2], dtype=np.uint8)
-                cv2.drawContours(limb_mask, [contour], -1, 255, -1)
-                
-                # Get bounding box for this limb
-                x, y, w, h = cv2.boundingRect(contour)
-                limb_roi = roi_frame[y:y+h, x:x+w]
-                limb_mask_section = limb_mask[y:y+h, x:x+w]
-                
-                # Detect color state for this limb
-                color_state = detect_color_state(limb_roi, limb_mask_section)
-                
-                if DEBUG_MODE:
-                    M = cv2.moments(contour)
-                    cx = int(M["m10"] / M["m00"]) if M["m00"] != 0 else 0
-                    cy = int(M["m01"] / M["m00"]) if M["m00"] != 0 else 0
-                    cx_norm = cx / ROI_WIDTH
-                    cy_norm = cy / ROI_HEIGHT
-                    print(f"  {limb_name}: {color_state} (area: {int(area)}, pos: {cx},{cy}, norm: {cx_norm:.2f},{cy_norm:.2f})")
-                
-                # Store current state (if limb appears multiple times, keep first detection)
-                if limb_name not in current_states:
-                    current_states[limb_name] = color_state
+            frame_signal_conf = {limb: 0.0 for limb in ALL_LIMBS}
+            for limb_name in ALL_LIMBS:
+                limb_mask = template_masks[limb_name]
+                mask_pixels = cv2.countNonZero(limb_mask)
+                min_pixels = max(3, int(mask_pixels * TEMPLATE_MASK_MIN_PIXELS_RATIO))
+                profile = 'core_relaxed' if limb_name in CORE_LIMBS else 'strict'
+                limb_analysis = analyze_color_state(
+                    roi_frame,
+                    mask=limb_mask,
+                    min_colored_pixels=min_pixels,
+                    profile=profile,
+                )
+                limb_state = limb_analysis['state']
+                limb_conf = limb_analysis['confidence']
+
+                if limb_state in ['green', 'yellow', 'red']:
+                    current_states[limb_name] = limb_state
+                    frame_signal_conf[limb_name] = limb_conf
+                    limbs_ever_seen.add(limb_name)
+                elif DEBUG_MODE:
+                    print(f"  {limb_name}: {limb_state} (conf: {limb_conf:.2f}, colored: {limb_analysis['total_colored']})")
             
             # Update detection history for temporal smoothing
             for limb_name in ALL_LIMBS:
@@ -338,10 +481,22 @@ def main():
                 # Add current detection to history
                 if limb_name in current_states:
                     detection_history[limb_name].append(current_states[limb_name])
+                    consecutive_absent[limb_name] = 0
                 else:
-                    # If we've seen this limb before, mark as 'missing'
+                    # If we've seen this limb before, use occlusion-aware missing handling.
                     if limb_name in limbs_ever_seen:
-                        detection_history[limb_name].append('missing')
+                        if model_visible_ratio < MIN_MODEL_VISIBLE_RATIO:
+                            # Too little model is visible; likely occlusion/background interference.
+                            detection_history[limb_name].append('occluded')
+                            frame_signal_conf[limb_name] = max(0.0, 1.0 - (model_visible_ratio / max(MIN_MODEL_VISIBLE_RATIO, 1e-6)))
+                        else:
+                            consecutive_absent[limb_name] += 1
+                            if consecutive_absent[limb_name] >= MISSING_GRACE_FRAMES:
+                                detection_history[limb_name].append('missing')
+                                frame_signal_conf[limb_name] = min(1.0, consecutive_absent[limb_name] / float(MISSING_GRACE_FRAMES))
+                            else:
+                                detection_history[limb_name].append('occluded')
+                                frame_signal_conf[limb_name] = consecutive_absent[limb_name] / float(MISSING_GRACE_FRAMES)
                     else:
                         detection_history[limb_name].append('unknown')
                 
@@ -351,6 +506,7 @@ def main():
             
             # Determine stable state for each limb (majority vote from history)
             stable_states = {}
+            stable_confidence = {}
             for limb_name in ALL_LIMBS:
                 if limb_name not in detection_history or len(detection_history[limb_name]) == 0:
                     continue
@@ -361,8 +517,8 @@ def main():
                 # Get most common state
                 most_common_state, count = state_counts.most_common(1)[0]
                 
-                # Use different thresholds based on state type
-                # Red/yellow (damage) = fast response, green/missing = more conservative
+                # Use different thresholds based on state type.
+                # Red/yellow (damage) = fast response, other states = more conservative.
                 if most_common_state in ['red', 'yellow']:
                     required_confidence = DAMAGE_CONFIDENCE
                 else:
@@ -370,30 +526,41 @@ def main():
                 
                 # Only use this state if it appears enough times
                 if count >= required_confidence:
-                    # Don't report 'unknown' states
-                    if most_common_state != 'unknown':
-                        stable_states[limb_name] = most_common_state
+                    stable_states[limb_name] = most_common_state
+                    temporal_conf = count / max(len(detection_history[limb_name]), 1)
+                    stable_confidence[limb_name] = (0.5 * temporal_conf) + (0.5 * frame_signal_conf.get(limb_name, 0.0))
+
+            # Immediate red override: if this frame has confident red, show it immediately.
+            for limb_name in ALL_LIMBS:
+                current_state = current_states.get(limb_name)
+                current_conf = frame_signal_conf.get(limb_name, 0.0)
+                if current_state == 'red' and current_conf >= RED_IMMEDIATE_CONF:
+                    stable_states[limb_name] = 'red'
+                    stable_confidence[limb_name] = max(stable_confidence.get(limb_name, 0.0), current_conf)
+                    red_latch_remaining[limb_name] = RED_LATCH_FRAMES
+                elif red_latch_remaining[limb_name] > 0:
+                    # Keep red visible for a couple frames to avoid missing quick spikes.
+                    stable_states[limb_name] = 'red'
+                    stable_confidence[limb_name] = max(stable_confidence.get(limb_name, 0.0), 0.45)
+                    red_latch_remaining[limb_name] -= 1
             
             # Print status of all limbs every frame
             print("\n--- Frame Update ---")
             
-            # Check for missing limbs (ones we've seen before but aren't visible now)
-            for limb_name in limbs_ever_seen:
-                if limb_name in stable_states and stable_states[limb_name] == 'missing':
-                    print(f"❌  {limb_name.replace('_', ' ').title()}: MISSING")
-            
-            # Print all currently detected limbs with stable states
+            # Always print all limbs with current stable state + confidence.
+            state_emoji = {
+                'red': '🔴',
+                'yellow': '🟡',
+                'green': '🟢',
+                'missing': '❌',
+                'occluded': '⚫',
+                'unknown': '⚪',
+            }
             for limb_name in ALL_LIMBS:
-                if limb_name in stable_states:
-                    color_state = stable_states[limb_name]
-                    if color_state == 'missing':
-                        continue  # Already printed above
-                    elif color_state == 'red':
-                        print(f"🔴  {limb_name.replace('_', ' ').title()}: RED")
-                    elif color_state == 'yellow':
-                        print(f"🟡  {limb_name.replace('_', ' ').title()}: YELLOW")
-                    elif color_state == 'green':
-                        print(f"🟢  {limb_name.replace('_', ' ').title()}: GREEN")
+                color_state = stable_states.get(limb_name, 'unknown')
+                conf = stable_confidence.get(limb_name, 0.0)
+                icon = state_emoji.get(color_state, '⚪')
+                print(f"{icon}  {limb_name.replace('_', ' ').title()}: {color_state.upper()} (conf: {conf:.2f})")
             
             # Show visualization window if enabled
             if SHOW_WINDOW:
