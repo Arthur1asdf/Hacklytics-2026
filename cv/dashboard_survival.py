@@ -19,7 +19,11 @@ LOG_DIR = Path(__file__).resolve().parent / "logs"
 
 @cache_data
 def load_run(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
+    try:
+        df = pd.read_csv(path)
+    except pd.errors.ParserError:
+        # Fallback for partially-written/corrupted rows in long-running captures.
+        df = pd.read_csv(path, engine="python", on_bad_lines="skip")
     if df.empty:
         return df
     df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -57,7 +61,7 @@ def main():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     files = sorted(LOG_DIR.glob("limb_run_*.csv"), reverse=True)
     if not files:
-        st.warning("No log files found. Run `cvopen.py` with `ENABLE_DATA_LOGGING = True` first.")
+        st.warning("No log files found. Run `cvopen.py` or `new_opencv.py` with `ENABLE_DATA_LOGGING = True` first.")
         return
 
     selected = st.selectbox("Choose run", files, format_func=lambda p: p.name, index=0)

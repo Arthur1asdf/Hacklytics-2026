@@ -2,10 +2,23 @@ import cv2
 import numpy as np
 from mss import mss
 import time
+import csv
+import os
+import sys
+import struct
+from pathlib import Path
+from datetime import datetime
 from collections import Counter
 from enum import Enum
 import serial
 from new_find_model import load_limb_templates
+import threading # <-- ADD THIS
+from elevenlabs.client import ElevenLabs # <-- ADD THIS
+from elevenlabs import play as elevenlabs_play # <-- ADD THIS
+try:
+    import winsound
+except Exception:
+    winsound = None
 
 # ============================================================
 # INITIALIZE ARDUINO SERIAL CONNECTION
@@ -35,6 +48,18 @@ SHOW_WINDOW = False
 SHOW_ONLY_ZOOM = False
 SAVE_DEBUG_IMAGE = True
 DEBUG_MODE = False
+ENABLE_DATA_LOGGING = True
+LOG_DIR = Path(__file__).resolve().parent / "logs"
+ENV_FILE = Path(__file__).resolve().parent / ".env"
+
+# TTS alerts (ElevenLabs)
+ENABLE_TTS_ALERTS = True
+TTS_TRIGGER_PHRASE = "you got shot"
+TTS_COOLDOWN_SECONDS = 1.5
+TTS_VOICE = os.getenv("ELEVENLABS_VOICE", "Rachel")
+TTS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "").strip()
+TTS_MODEL = os.getenv("ELEVENLABS_MODEL", "eleven_multilingual_v2")
+COLOR_STATES = {"green", "yellow", "red"}
 # ============================================================
 
 # Minimum contour area to avoid noise
@@ -262,7 +287,33 @@ def initialize_arduino():
         time.sleep(2)
     except Exception as e:
         print(f"⚠️  Failed to connect to Arduino: {e}")
-        arduino_serial = None
+arduino_serial = None
+tts_client = None
+last_tts_time = 0.0
+resolved_tts_voice_id = None
+
+def load_local_env(env_path: Path):
+    """Load KEY=VALUE pairs from a local .env file into os.environ."""
+    if not env_path.exists():
+        return
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key:
+                continue
+            if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+                value = value[1:-1]
+            os.environ.setdefault(key, value)
+    except Exception as e:
+        print(f"Warning: failed to load {env_path.name}: {e}")
+
+# Load .env values for API keys/config before runtime initialization.
+load_local_env(ENV_FILE)
 
 def write_arduino(limb_type: LimbType, limb_status: LimbState):
     global arduino_serial
@@ -281,6 +332,181 @@ def write_arduino(limb_type: LimbType, limb_status: LimbState):
         
     except Exception as e:
         print(f"⚠️  Failed to send data to Arduino: {e}")
+
+def init_tts():
+    global tts_client, resolved_tts_voice_id
+    if not ENABLE_TTS_ALERTS:
+        return
+    api_key = os.getenv("ELEVENLABS_API_KEY")
+    if not api_key:
+        print("TTS disabled: ELEVENLABS_API_KEY not set.")
+        return
+    try:
+        tts_client = ElevenLabs(api_key=api_key)
+        resolved_tts_voice_id = resolve_voice_id()
+        if resolved_tts_voice_id is None:
+            print("TTS disabled: unable to resolve ElevenLabs voice ID.")
+            tts_client = None
+            return
+        print(f"TTS enabled (ElevenLabs), voice_id={resolved_tts_voice_id}.")
+    except Exception as e:
+        print(f"TTS init failed: {e}")
+        tts_client = None
+
+def resolve_voice_id():
+    """
+    Resolve a voice ID for current ElevenLabs SDK versions.
+    Priority:
+      1) ELEVENLABS_VOICE_ID env var
+      2) If ELEVENLABS_VOICE already looks like an ID, use it
+      3) Look up by voice name via API
+      4) Fallback Rachel public ID
+    """
+    if tts_client is None:
+        return None
+    if TTS_VOICE_ID:
+        return TTS_VOICE_ID
+    if len(TTS_VOICE) >= 20 and " " not in TTS_VOICE:
+        return TTS_VOICE
+    try:
+        voices = tts_client.voices.search(search=TTS_VOICE, page_size=25)
+        for v in getattr(voices, "voices", []):
+            if str(getattr(v, "name", "")).strip().lower() == TTS_VOICE.strip().lower():
+                return getattr(v, "voice_id", None)
+        for v in getattr(voices, "voices", []):
+            voice_id = getattr(v, "voice_id", None)
+            if voice_id:
+                return voice_id
+    except Exception as e:
+        print(f"TTS voice lookup failed: {e}")
+    if TTS_VOICE.strip().lower() == "rachel":
+        return "21m00Tcm4TlvDq8ikWAM"
+    return None
+
+def finalize_wav_header(audio_bytes: bytes) -> bytes:
+    """
+    ElevenLabs streaming WAV may use placeholder chunk sizes (0xFFFFFFFF).
+    Replace RIFF/data chunk sizes with actual values for strict players (winsound).
+    """
+    if len(audio_bytes) < 44 or audio_bytes[:4] != b"RIFF" or audio_bytes[8:12] != b"WAVE":
+        return audio_bytes
+
+    fixed = bytearray(audio_bytes)
+    riff_size = len(fixed) - 8
+    fixed[4:8] = struct.pack("<I", max(0, riff_size))
+
+    data_idx = bytes(fixed).find(b"data")
+    if data_idx != -1 and data_idx + 8 <= len(fixed):
+        data_size = len(fixed) - (data_idx + 8)
+        fixed[data_idx + 4:data_idx + 8] = struct.pack("<I", max(0, data_size))
+
+    return bytes(fixed)
+
+def _speak_shot_alert():
+    if tts_client is None or resolved_tts_voice_id is None:
+        return
+    try:
+        print(f"TTS: {TTS_TRIGGER_PHRASE}")
+        audio_stream = tts_client.text_to_speech.convert(
+            voice_id=resolved_tts_voice_id,
+            text=TTS_TRIGGER_PHRASE,
+            model_id=TTS_MODEL,
+            output_format="wav_22050",
+        )
+        audio = finalize_wav_header(b"".join(audio_stream))
+        print("TTS: audio generated, playing...")
+        if sys.platform.startswith("win") and winsound is not None:
+            winsound.PlaySound(audio, winsound.SND_MEMORY)
+        elif callable(elevenlabs_play):
+            elevenlabs_play(audio)
+        elif hasattr(elevenlabs_play, "play"):
+            elevenlabs_play.play(audio)
+        else:
+            raise RuntimeError("Unsupported elevenlabs.play API in installed version.")
+        print("TTS: playback finished.")
+    except Exception as e:
+        print(f"TTS playback failed: {e}")
+
+def trigger_shot_alert():
+    global last_tts_time
+    if tts_client is None:
+        return
+    now = time.monotonic()
+    if now - last_tts_time < TTS_COOLDOWN_SECONDS:
+        return
+    last_tts_time = now
+    _speak_shot_alert()
+
+def test_tts_once():
+    """Quick local test for ElevenLabs TTS without starting vision loop."""
+    init_tts()
+    if tts_client is None:
+        print("TTS test failed: client not initialized.")
+        return 1
+    print("Running TTS test...")
+    trigger_shot_alert()
+    print("TTS test complete.")
+    return 0
+
+def init_run_logger():
+    """
+    Initialize CSV logging for downstream data analysis.
+    Returns (file_handle, csv_writer, run_id).
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = LOG_DIR / f"limb_run_{run_id}.csv"
+
+    fieldnames = [
+        "timestamp",
+        "run_id",
+        "frame_idx",
+        "elapsed_s",
+        "model_visible_ratio",
+        "green_count",
+        "yellow_count",
+        "red_count",
+        "missing_count",
+        "occluded_count",
+        "unknown_count",
+        "critical_load",
+    ]
+    for limb in ALL_LIMBS:
+        fieldnames.append(f"{limb}_state")
+        fieldnames.append(f"{limb}_conf")
+
+    fh = open(log_path, "w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(fh, fieldnames=fieldnames)
+    writer.writeheader()
+    print(f"Data logging enabled: {log_path}")
+    return fh, writer, run_id
+
+def log_frame(writer, run_id, frame_idx, start_time, model_visible_ratio, stable_states, stable_confidence):
+    """Write one frame row for analytics."""
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "run_id": run_id,
+        "frame_idx": frame_idx,
+        "elapsed_s": round(time.time() - start_time, 2),
+        "model_visible_ratio": round(float(model_visible_ratio), 5),
+    }
+
+    state_counts = Counter()
+    for limb in ALL_LIMBS:
+        state = stable_states.get(limb, "unknown")
+        conf = float(stable_confidence.get(limb, 0.0))
+        row[f"{limb}_state"] = state
+        row[f"{limb}_conf"] = round(conf, 4)
+        state_counts[state] += 1
+
+    row["green_count"] = state_counts.get("green", 0)
+    row["yellow_count"] = state_counts.get("yellow", 0)
+    row["red_count"] = state_counts.get("red", 0)
+    row["missing_count"] = state_counts.get("missing", 0)
+    row["occluded_count"] = state_counts.get("occluded", 0)
+    row["unknown_count"] = state_counts.get("unknown", 0)
+    row["critical_load"] = (2 * row["red_count"]) + row["yellow_count"]
+    writer.writerow(row)
 
 def adjust_roi_interactive():
     """
@@ -418,11 +644,38 @@ def main():
             return  # User cancelled
     
     initialize_arduino()
+    init_tts()
+    
+    # Initialize data logger for analytics
+    log_fh = None
+    log_writer = None
+    run_id = None
+    frame_idx = 0
+    start_time = time.time()
+    if ENABLE_DATA_LOGGING:
+        log_fh, log_writer, run_id = init_run_logger()
 
     print("=" * 60)
     print("Starting Player Health Monitor...")
     print("=" * 60)
-    print("Press Ctrl+C to quit")
+    if SHOW_WINDOW:
+        print("Press 'q' to quit")
+        print("\nVISUALIZATION MODE:")
+        if SHOW_ONLY_ZOOM:
+            print("- Showing ONLY zoomed view (SHOW_ONLY_ZOOM = True)")
+            print("- You should see the player model in the window")
+            print("- If not, adjust ROI_X, ROI_Y, ROI_WIDTH, ROI_HEIGHT")
+        else:
+            print("1. Look at the window that appears")
+            print("2. Find where the player model is on your screen")
+            print("3. Edit the code to adjust these values:")
+        print(f"   - ROI_X (currently {ROI_X}) - Move box LEFT/RIGHT")
+        print(f"   - ROI_Y (currently {ROI_Y}) - Move box UP/DOWN")
+        print(f"   - ROI_WIDTH (currently {ROI_WIDTH}) - Make box WIDER/NARROWER")
+        print(f"   - ROI_HEIGHT (currently {ROI_HEIGHT}) - Make box TALLER/SHORTER")
+        print("\nThe box should capture the entire player model!")
+    else:
+        print("Press Ctrl+C to quit")
     print(f"\nCurrent detection box: Position ({ROI_X}, {ROI_Y}), Size {ROI_WIDTH}x{ROI_HEIGHT}")
     print("=" * 60)
     print("Monitoring started...\n")
@@ -460,6 +713,7 @@ def main():
     
     debug_image_saved = False
     limb_object = LimbStatus()
+    prev_color_states = {}
     
     try:
         while True:
@@ -609,6 +863,17 @@ def main():
                     stable_states[limb_name] = 'red'
                     stable_confidence[limb_name] = max(stable_confidence.get(limb_name, 0.0), 0.45)
                     red_latch_remaining[limb_name] -= 1
+
+            # TTS alert when any stable color changes for a limb.
+            color_changed = False
+            for limb_name in ALL_LIMBS:
+                current_color = stable_states.get(limb_name, "unknown")
+                previous_color = prev_color_states.get(limb_name)
+                if previous_color in COLOR_STATES and current_color in COLOR_STATES and current_color != previous_color:
+                    color_changed = True
+                prev_color_states[limb_name] = current_color
+            if color_changed:
+                trigger_shot_alert()
             
             # Print status
             print("\n--- Frame Update ---")
@@ -636,6 +901,93 @@ def main():
 
                     if limb_object.hasStatusChanged(limb_type=limb_type):
                         write_arduino(limb_type, limb_status)
+
+            if ENABLE_DATA_LOGGING and log_writer is not None:
+                log_frame(
+                    writer=log_writer,
+                    run_id=run_id,
+                    frame_idx=frame_idx,
+                    start_time=start_time,
+                    model_visible_ratio=model_visible_ratio,
+                    stable_states=stable_states,
+                    stable_confidence=stable_confidence,
+                )
+                frame_idx += 1
+
+            # Show visualization window if enabled
+            if SHOW_WINDOW:
+                if SHOW_ONLY_ZOOM:
+                    # Only show the zoomed view - easier to position
+                    if roi_frame.size > 0:
+                        display_zoom = roi_frame.copy()
+                        cv2.putText(
+                            display_zoom,
+                            f"Pos: ({ROI_X},{ROI_Y}) Size: {ROI_WIDTH}x{ROI_HEIGHT}",
+                            (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.7,
+                            (0, 255, 255),
+                            2,
+                        )
+                        cv2.putText(
+                            display_zoom,
+                            "Adjust ROI_X, ROI_Y, ROI_WIDTH, ROI_HEIGHT",
+                            (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 255, 255),
+                            1,
+                        )
+                        cv2.imshow(
+                            "What the detector sees - Should show player model",
+                            cv2.resize(display_zoom, (600, 825)),
+                        )
+                else:
+                    # Show both windows
+                    frame_display = frame.copy()
+                    cv2.rectangle(
+                        frame_display,
+                        (ROI_X, ROI_Y),
+                        (ROI_X + ROI_WIDTH, ROI_Y + ROI_HEIGHT),
+                        (0, 255, 255),
+                        4,
+                    )
+                    cv2.putText(
+                        frame_display,
+                        "<-- MOVE THIS YELLOW BOX TO COVER PLAYER MODEL",
+                        (ROI_X + ROI_WIDTH + 10, ROI_Y + 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 255),
+                        2,
+                    )
+                    cv2.putText(
+                        frame_display,
+                        f"Position: ({ROI_X},{ROI_Y}) | Size: {ROI_WIDTH}x{ROI_HEIGHT}",
+                        (ROI_X, ROI_Y - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 255),
+                        2,
+                    )
+                    scale = 0.5 if monitor['width'] > 2000 else 0.6
+                    cv2.imshow(
+                        "YOUR SCREEN - Find the player model and move yellow box to it",
+                        cv2.resize(
+                            frame_display,
+                            (int(monitor['width'] * scale), int(monitor['height'] * scale)),
+                        ),
+                    )
+
+                    if roi_frame.size > 0:
+                        cv2.imshow(
+                            "Inside the Yellow Box (what will be analyzed)",
+                            cv2.resize(roi_frame, (600, 825)),
+                        )
+
+                # Check for quit
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
             
             # Small delay
             time.sleep(0.5)
@@ -643,6 +995,13 @@ def main():
     except KeyboardInterrupt:
         print("\n\nMonitoring stopped.")
         print("Goodbye!")
+    finally:
+        if log_fh is not None:
+            log_fh.close()
+        if SHOW_WINDOW:
+            cv2.destroyAllWindows()
 
 if __name__ == "__main__":
+    if "--test-tts" in sys.argv:
+        raise SystemExit(test_tts_once())
     main()
