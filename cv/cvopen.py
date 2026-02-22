@@ -2,6 +2,9 @@ import cv2
 import numpy as np
 from mss import mss
 import time
+import csv
+from pathlib import Path
+from datetime import datetime
 from collections import Counter
 from enum import Enum
 from limb_template_generator import load_limb_templates
@@ -23,6 +26,8 @@ SHOW_WINDOW = False  # No GUI - runs in background
 SHOW_ONLY_ZOOM = False
 SAVE_DEBUG_IMAGE = True  # Saves one image to verify position
 DEBUG_MODE = False  # Print all detections for debugging
+ENABLE_DATA_LOGGING = True  # Save frame-level limb states for analytics dashboard
+LOG_DIR = Path(__file__).resolve().parent / "logs"
 # ============================================================
 
 # Minimum contour area to avoid noise (adjust if getting too many/few detections)
@@ -525,6 +530,66 @@ def write_arduino(limb_type: LimbType, limb_status: LimbState):
     except Exception as e:
         print(f"⚠️  Failed to send data to Arduino: {e}")
 
+def init_run_logger():
+    """
+    Initialize CSV logging for downstream data analysis.
+    Returns (file_handle, csv_writer, run_id).
+    """
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = LOG_DIR / f"limb_run_{run_id}.csv"
+
+    fieldnames = [
+        "timestamp",
+        "run_id",
+        "frame_idx",
+        "elapsed_s",
+        "model_visible_ratio",
+        "green_count",
+        "yellow_count",
+        "red_count",
+        "missing_count",
+        "occluded_count",
+        "unknown_count",
+        "critical_load",
+    ]
+    for limb in ALL_LIMBS:
+        fieldnames.append(f"{limb}_state")
+        fieldnames.append(f"{limb}_conf")
+
+    fh = open(log_path, "w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(fh, fieldnames=fieldnames)
+    writer.writeheader()
+    print(f"📊 Data logging enabled: {log_path}")
+    return fh, writer, run_id
+
+def log_frame(writer, run_id, frame_idx, start_time, model_visible_ratio, stable_states, stable_confidence):
+    """Write one frame row for analytics."""
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "run_id": run_id,
+        "frame_idx": frame_idx,
+        "elapsed_s": round(time.time() - start_time, 2),
+        "model_visible_ratio": round(float(model_visible_ratio), 5),
+    }
+
+    state_counts = Counter()
+    for limb in ALL_LIMBS:
+        state = stable_states.get(limb, "unknown")
+        conf = float(stable_confidence.get(limb, 0.0))
+        row[f"{limb}_state"] = state
+        row[f"{limb}_conf"] = round(conf, 4)
+        state_counts[state] += 1
+
+    row["green_count"] = state_counts.get("green", 0)
+    row["yellow_count"] = state_counts.get("yellow", 0)
+    row["red_count"] = state_counts.get("red", 0)
+    row["missing_count"] = state_counts.get("missing", 0)
+    row["occluded_count"] = state_counts.get("occluded", 0)
+    row["unknown_count"] = state_counts.get("unknown", 0)
+    row["critical_load"] = (2 * row["red_count"]) + row["yellow_count"]
+    writer.writerow(row)
+
 def main():
     """
     Main function to monitor player model limb colors using contour detection
@@ -532,6 +597,15 @@ def main():
 
     # Initialize Arduino connection at startup
     initialize_arduino()
+    
+    # Initialize data logger for analytics
+    log_fh = None
+    log_writer = None
+    run_id = None
+    frame_idx = 0
+    start_time = time.time()
+    if ENABLE_DATA_LOGGING:
+        log_fh, log_writer, run_id = init_run_logger()
 
     print("=" * 60)
     print("Starting Player Health Monitor...")
@@ -776,6 +850,18 @@ def main():
 
                     if (limb_object.hasStatusChanged(limb_type=limb_type)):
                         write_arduino(limb_type, limb_status)
+
+            if ENABLE_DATA_LOGGING and log_writer is not None:
+                log_frame(
+                    writer=log_writer,
+                    run_id=run_id,
+                    frame_idx=frame_idx,
+                    start_time=start_time,
+                    model_visible_ratio=model_visible_ratio,
+                    stable_states=stable_states,
+                    stable_confidence=stable_confidence,
+                )
+                frame_idx += 1
             
             # Show visualization window if enabled
             if SHOW_WINDOW:
@@ -823,6 +909,8 @@ def main():
         print("\n\nMonitoring stopped.")
         print("Goodbye!")
     finally:
+        if log_fh is not None:
+            log_fh.close()
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
 
