@@ -3,6 +3,13 @@ import numpy as np
 from mss import mss
 import time
 from collections import Counter
+from enum import Enum
+import serial
+
+# ============================================================
+# INITIALIZE ARDUINO SERIAL CONNECTION
+# ============================================================
+arduino_serial = None
 
 # ============================================================
 # ADJUST THESE VALUES FOR YOUR SCREEN/RESOLUTION  
@@ -10,10 +17,10 @@ from collections import Counter
 # Based on your screenshot at 2880x1864 resolution
 # Player model is at top-left of YouTube video
 
-ROI_X = 17       # Left edge where player model appears
-ROI_Y = 105         # Below browser tabs, at video content
-ROI_WIDTH = 50     # Width of player model
-ROI_HEIGHT = 120    # Height of player model (head to feet)
+ROI_X = 28       # Left edge where player model appears
+ROI_Y = 140         # Below browser tabs, at video content
+ROI_WIDTH = 120     # Width of player model
+ROI_HEIGHT = 205    # Height of player model (head to feet)
 
 # VISUALIZATION MODE
 SHOW_WINDOW = False  # No GUI - runs in background
@@ -44,10 +51,73 @@ LIMB_ZONES = {
     'torso': (0.30, 0.40, 0.70, 0.60),
     # Keep arm zones tighter/outside center body so missing-arm fallback is less prone to torso bleed.
     'left_arm': (0.00, 0.15, 0.22, 0.60),
-    'right_arm': (0.78, 0.15, 1.00, 0.60),
+    'right_arm': (0.78, 0.15, 1.0, 0.60),
     'left_leg': (0.20, 0.60, 0.50, 1.00),
     'right_leg': (0.50, 0.60, 0.80, 1.00),
 }
+
+class LimbState(Enum):
+    GREEN = '0',
+    YELLOW = '1',
+    RED = '2',
+    MISSING = '3',
+    OCCLUDED = '4',
+    UNKNOWN = '5',
+
+class LimbType(Enum):
+    LEFT_ARM = '0',
+    RIGHT_ARM = '1',
+    LEFT_LEG = '2',
+    RIGHT_LEG = '3',
+
+class LimbStatus:
+    def __init__(self):
+        self.left_leg = None
+        self.right_leg = None
+        self.left_arm = None
+        self.right_arm = None
+        self.prev_left_arm = None
+        self.prev_right_arm = None
+        self.prev_left_leg = None
+        self.prev_right_leg = None
+
+    def setLimbStatus(self, limb_type: LimbType, limb_state: LimbState):
+        if limb_type == LimbType.LEFT_ARM:
+            self.prev_left_arm = self.left_arm
+            self.left_arm = limb_state
+        elif limb_type == LimbType.RIGHT_ARM:
+            self.prev_right_arm = self.right_arm
+            self.right_arm = limb_state
+        elif limb_type == LimbType.LEFT_LEG:
+            self.prev_left_leg = self.left_leg
+            self.left_leg = limb_state
+        elif limb_type == LimbType.RIGHT_LEG:
+            self.prev_right_leg = self.right_leg
+            self.right_leg = limb_state
+
+    def getLimbStatus(self, limb_type: LimbType):
+        if limb_type == LimbType.LEFT_ARM:
+            return self.left_arm
+        elif limb_type == LimbType.RIGHT_ARM:
+            return self.right_arm
+        elif limb_type == LimbType.LEFT_LEG:
+            return self.left_leg
+        elif limb_type == LimbType.RIGHT_LEG:
+            return self.right_leg
+        else:
+            return None
+    
+    def hasStatusChanged(self, limb_type: LimbType):
+        if limb_type == LimbType.LEFT_ARM:
+            return self.left_arm != self.prev_left_arm
+        elif limb_type == LimbType.RIGHT_ARM:
+            return self.right_arm != self.prev_right_arm
+        elif limb_type == LimbType.LEFT_LEG:
+            return self.left_leg != self.prev_left_leg
+        elif limb_type == LimbType.RIGHT_LEG:
+            return self.right_leg != self.prev_right_leg
+        else:
+            return False
 
 def identify_limb(contour, roi_width, roi_height):
     """
@@ -324,10 +394,44 @@ def build_limb_template_masks(roi_w, roi_h):
 
     return masks
 
+def initialize_arduino():
+    # Initialize serial communication with Arduino
+    global arduino_serial
+    try:
+        arduino_serial = serial.Serial(port='/dev/cu.usbmodem101', baudrate=9600, timeout=1)
+        print(f"✓ Connected to Arduino on '/dev/cu.usbmodem101' at 9600 baud.")
+        time.sleep(2)
+    except Exception as e:
+        print(f"⚠️  Failed to connect to Arduino: {e}")
+        arduino_serial = None
+
+def write_arduino(limb_type: LimbType, limb_status: LimbState):
+    global arduino_serial
+
+    if arduino_serial is None:
+        print("⚠️  Arduino not connected")
+        return
+
+    try:
+        limb = limb_type.value[0]  # '0', '1', '2', '3'
+        status = limb_status.value[0]  # '0', '1', '2', '3', etc.
+        arduino_serial.write(limb.encode())
+        arduino_serial.write(status.encode())
+        # time.sleep(0.75)  # Remove this - not needed anymore!
+        print(f"Sent to Arduino: Limb={limb}, Status={status}")
+        
+    except Exception as e:
+        print(f"⚠️  Failed to send data to Arduino: {e}")
+
+
 def main():
     """
     Main function to monitor player model limb colors using contour detection
     """
+
+    # Initialize Arduino connection at startup
+    initialize_arduino()
+
     print("=" * 60)
     print("Starting Player Health Monitor...")
     print("=" * 60)
@@ -378,6 +482,8 @@ def main():
     # Debug image flag
     debug_image_saved = False
     template_masks = build_limb_template_masks(ROI_WIDTH, ROI_HEIGHT)
+
+    limb_object = LimbStatus();
     
     try:
         while True:
@@ -556,11 +662,21 @@ def main():
                 'occluded': '⚫',
                 'unknown': '⚪',
             }
+            
             for limb_name in ALL_LIMBS:
-                color_state = stable_states.get(limb_name, 'unknown')
+                color_state = stable_states.get(limb_name, "unknown")
                 conf = stable_confidence.get(limb_name, 0.0)
                 icon = state_emoji.get(color_state, '⚪')
                 print(f"{icon}  {limb_name.replace('_', ' ').title()}: {color_state.upper()} (conf: {conf:.2f})")
+                
+                # SEND STATUS TO ARDUINO
+                if (limb_name == "left_arm" or limb_name == "left_leg" or limb_name == "right_arm" or limb_name == "right_leg"):
+                    limb_type = LimbType[limb_name.upper()]
+                    limb_status = LimbState[color_state.upper()]
+                    limb_object.setLimbStatus(limb_type=limb_type, limb_state=limb_status)
+
+                    if (limb_object.hasStatusChanged(limb_type=limb_type)):
+                        write_arduino(limb_type, limb_status)
             
             # Show visualization window if enabled
             if SHOW_WINDOW:
