@@ -1,53 +1,53 @@
+// One pin per limb: green = off, yellow = blink, red = on. Other modes = off.
+// Limb indices: 0 = left arm, 1 = right arm, 2 = left leg, 3 = right leg
+// State: '0' = green (off), '1' = yellow (blink), '2' = red (on), '3'/'4'/'5' = off
+
+const int PINS[] = {8, 9, 10, 11};  // left arm, right arm, left leg, right leg
+const int NUM_LIMBS = 4;
+
+// Stored state per limb: 0=green(off), 1=yellow(blink), 2=red(on), 3+=off
+char limbState[NUM_LIMBS] = {'0', '0', '0', '0'};
+
+const unsigned long BLINK_MS = 500;
+
 void setup() {
   Serial.begin(9600);
-  pinMode(8, HIGH);
-  pinMode(9, HIGH);
-  pinMode(10, HIGH);
-  pinMode(11, HIGH);
-}
-
-void runStatus(char stat, int pin) {
-  if (stat == '0') { // GREEN
-    digitalWrite(pin, HIGH);
-    //delay(1000);
-  } else if (stat == '1') {
-    digitalWrite(pin, HIGH);
-    delay(500);
-    digitalWrite(pin, LOW);
-    delay(500);
-  } else if (stat == '2') {
-    digitalWrite(pin, HIGH);
-    delay(500);
-    digitalWrite(pin, LOW);
-    delay(500);
-  } else if (stat == '3') {
-    digitalWrite(pin, HIGH);
-    delay(500);
-    digitalWrite(pin, LOW);
-    delay(500);
+  for (int i = 0; i < NUM_LIMBS; i++) {
+    pinMode(PINS[i], OUTPUT);
+    digitalWrite(PINS[i], LOW);
   }
 }
 
 void loop() {
+  // Read any new limb/status from Python (2 bytes: limb index, state)
   if (Serial.available() >= 2) {
     char limbChar = Serial.read();
-    char statusChar = Serial.read(); 
-
-    // Blink the LED to show we received something
-    switch (limbChar) {
-      case '0': // left arm
-        runStatus(statusChar, 8);
-        break;
-      case '1': // right arm
-        runStatus(statusChar, 9);
-        break;
-      case '2': // left leg
-        runStatus(statusChar, 10);
-        break;
-      case '3': // right leg
-        runStatus(statusChar, 11);
-        break;
+    char statusChar = Serial.read();
+    int idx = limbChar - '0';
+    if (idx >= 0 && idx < NUM_LIMBS) {
+      limbState[idx] = statusChar;
     }
   }
-  digitalWrite(8, LOW);
+
+  unsigned long t = millis();
+  int blinkOn = (t / BLINK_MS) % 2;
+
+  for (int i = 0; i < NUM_LIMBS; i++) {
+    int pin = PINS[i];
+    char s = limbState[i];
+
+    if (s == '0') {
+      // Green: off
+      digitalWrite(pin, LOW);
+    } else if (s == '1') {
+      // Yellow: blink
+      digitalWrite(pin, blinkOn ? HIGH : LOW);
+    } else if (s == '2') {
+      // Red: constantly on
+      digitalWrite(pin, HIGH);
+    } else {
+      // Missing / Occluded / Unknown: off
+      digitalWrite(pin, LOW);
+    }
+  }
 }

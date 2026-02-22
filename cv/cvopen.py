@@ -4,6 +4,7 @@ from mss import mss
 import time
 from collections import Counter
 from enum import Enum
+from limb_template_generator import load_limb_templates
 import serial
 
 # ============================================================
@@ -67,8 +68,8 @@ class LimbState(Enum):
 
 class LimbType(Enum):
     LEFT_ARM = '0',
-    RIGHT_ARM = '1',
-    LEFT_LEG = '2',
+    LEFT_LEG = '1',
+    RIGHT_ARM = '2',
     RIGHT_LEG = '3',
 
 class LimbStatus:
@@ -581,7 +582,7 @@ def main():
     
     # Debug image flag
     debug_image_saved = False
-    template_masks = build_limb_template_masks(ROI_WIDTH, ROI_HEIGHT)
+    template_masks = load_limb_templates()
 
     limb_object = LimbStatus();
     
