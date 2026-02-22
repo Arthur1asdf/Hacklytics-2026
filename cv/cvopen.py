@@ -11,9 +11,9 @@ from collections import Counter
 # Player model is at top-left of YouTube video
 
 ROI_X = 17       # Left edge where player model appears
-ROI_Y = 105         # Below browser tabs, at video content
-ROI_WIDTH = 50     # Width of player model
-ROI_HEIGHT = 120    # Height of player model (head to feet)
+ROI_Y = 35         # Below browser tabs, at video content
+ROI_WIDTH = 200     # Width of player model
+ROI_HEIGHT = 370    # Height of player model (head to feet)
 
 # VISUALIZATION MODE
 SHOW_WINDOW = False  # No GUI - runs in background
@@ -35,8 +35,35 @@ CONTOUR_CONF_FALLBACK = 0.55  # Generic contour fallback threshold
 RED_CONTOUR_CONF_FALLBACK = 0.40  # Allow red through with lower contour confidence
 RED_IMMEDIATE_CONF = 0.48  # If current-frame red confidence exceeds this, show red immediately
 RED_LATCH_FRAMES = 2  # Keep immediate red visible briefly to avoid flicker
-TEMPLATE_MASK_MIN_PIXELS_RATIO = 0.10  # Required colored coverage within each traced limb mask
+TEMPLATE_MASK_MIN_PIXELS_RATIO = 0.03  # Required colored coverage within each traced limb mask (lower for thin limbs)
 
+# Small pixel offsets to shift the traced/template limb masks when they
+# don't line up perfectly with your captured contours. Adjust these to
+# move all template boxes at once (can be positive or negative).
+TEMPLATE_SHIFT_X = 2
+TEMPLATE_SHIFT_Y = 2
+
+# Per-limb fine alignment (px). Tweak these to position each template independently.
+# Format: 'limb': (x_offset_pixels, y_offset_pixels)
+PER_LIMB_OFFSETS = {
+    'head': (0, -8),
+    'chest': (0, -30),
+    'torso': (0, -38),
+    'left_arm': (-8, 4),
+    'right_arm': (8, 4),
+    'left_leg': (-6, -20),
+    'right_leg': (6, -20),
+}
+
+# How many pixels to shrink the chest polygon by (approx). Increase to reduce overlap.
+CHEST_SHRINK_PX = 8
+# How many pixels to shrink the torso polygon by (approx). Increase to reduce overlap.
+TORSO_SHRINK_PX = 26
+
+# Leg growth (px) to make leg boxes larger and fit the silhouette better
+LEG_GROW_PX = 10
+# Additional pixels to add to leg stroke thickness
+LEG_THICK_ADJUST = 2
 # Fallback limb zones (x1, y1, x2, y2) normalized to ROI dimensions
 LIMB_ZONES = {
     'head': (0.30, 0.00, 0.70, 0.25),
@@ -128,56 +155,31 @@ def analyze_color_state(roi_section, mask=None, min_colored_pixels=3, profile='s
     if mask is not None:
         hsv = cv2.bitwise_and(hsv, hsv, mask=mask)
     
-    # Define NON-OVERLAPPING color ranges - must match the thresholds used in main
-    # VERY HIGH saturation/value to only detect bright player model, ignore environment
+    # Define color ranges for classification
+    # Green: hue 40-90
+    green_mask = cv2.inRange(hsv, np.array([40, 0, 38]), np.array([90, 255, 255]))
     
-    # Green range (hue 45-85, VERY HIGH saturation/value)
-    green_lower = np.array([45, 75, 95])
-    green_upper = np.array([85, 255, 255])
+    # Yellow: hue 15-45
+    yellow_mask = cv2.inRange(hsv, np.array([15, 0, 38]), np.array([45, 255, 255]))
     
-    # Yellow range (hue 18-44, VERY HIGH saturation/value)
-    yellow_lower = np.array([18, 75, 95])
-    yellow_upper = np.array([44, 255, 255])
-    
-    if profile == 'core_relaxed':
-        # For chest/torso only: include darker warm reds.
-        orange_lower = np.array([5, 65, 60])
-        orange_upper = np.array([21, 255, 255])
-        red_lower1 = np.array([0, 65, 60])
-        red_lower2 = np.array([170, 65, 60])
-        red_soft_bias = True
-    else:
-        # Default strict profile for head/arms/legs to avoid environment-driven false red.
-        orange_lower = np.array([5, 80, 100])
-        orange_upper = np.array([18, 255, 255])
-        red_lower1 = np.array([0, 80, 100])
-        red_lower2 = np.array([170, 80, 100])
-        red_soft_bias = False
-
-    # Pure red range
-    red_upper1 = np.array([5, 255, 255])
-    red_upper2 = np.array([180, 255, 255])
-    
-    # Create masks
-    green_mask = cv2.inRange(hsv, green_lower, green_upper)
-    yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
-    orange_mask = cv2.inRange(hsv, orange_lower, orange_upper)
-    red_mask1 = cv2.inRange(hsv, red_lower1, red_upper1)
-    red_mask2 = cv2.inRange(hsv, red_lower2, red_upper2)
+    # Red: hue 0-15 and 160-180
+    red_mask1 = cv2.inRange(hsv, np.array([0, 0, 38]), np.array([15, 255, 255]))
+    red_mask2 = cv2.inRange(hsv, np.array([160, 0, 38]), np.array([180, 255, 255]))
     red_mask = cv2.bitwise_or(red_mask1, red_mask2)
     
-    # Combine orange and red for "red" detection (but NOT yellow)
-    red_combined = cv2.bitwise_or(orange_mask, red_mask)
-    
-    # Count pixels for each color - these are now non-overlapping
+    # Count pixels for each color
     green_pixels = cv2.countNonZero(green_mask)
     yellow_pixels = cv2.countNonZero(yellow_mask)
-    red_pixels = cv2.countNonZero(red_combined)
+    red_pixels = cv2.countNonZero(red_mask)
     
     total_colored = green_pixels + yellow_pixels + red_pixels
-    
-    total_pixels = max(int(roi_section.shape[0] * roi_section.shape[1]), 1)
-    coverage_ratio = total_colored / total_pixels
+
+    # If a mask was provided, compute coverage relative to the masked area
+    if mask is not None:
+        total_pixels = max(int(cv2.countNonZero(mask)), 1)
+    else:
+        total_pixels = max(int(roi_section.shape[0] * roi_section.shape[1]), 1)
+    coverage_ratio = total_colored / float(total_pixels)
 
     # Need minimum pixels to make a determination
     if total_colored < min_colored_pixels:
@@ -192,32 +194,62 @@ def analyze_color_state(roi_section, mask=None, min_colored_pixels=3, profile='s
         }
     
     # Determine dominant color with clear priority
-    # Check each color independently with very low thresholds (10%)
+    # Check each color independently using colored pixels as the reference
     total = max(total_colored, 1)
-    
+
     red_pct = red_pixels / total
     yellow_pct = yellow_pixels / total
     green_pct = green_pixels / total
+
+    # Determine if we should be lenient with red for core limbs
+    red_soft_bias = (profile == 'core_relaxed')
     
-    # Soft red bias only for chest/torso profile
+    # Slightly more permissive thresholds to reduce false 'unknown' reports
+    red_threshold = 0.10 if red_soft_bias else 0.12
+    yellow_threshold = 0.08
+    green_threshold = 0.08
+
+    # If analyzing a small mask (typical for arms/hands), be more permissive
+    # so background bleed doesn't force an 'unknown' result.
+    if mask is not None:
+        masked_area = cv2.countNonZero(mask)
+        if masked_area < 300:
+            green_threshold = 0.06
+            yellow_threshold = 0.06
+            red_threshold = 0.10
+
     state = None
-    if red_soft_bias and red_pct >= 0.08 and red_pct >= (yellow_pct * 0.75):
+    # Soft red bias only for chest/torso profile
+    if red_soft_bias and red_pct >= 0.07 and red_pct >= (yellow_pct * 0.75):
         state = 'red'
-    elif red_pct > (0.10 if red_soft_bias else 0.14):
+    elif red_pct > red_threshold:
         state = 'red'
-    elif yellow_pct > 0.10:
+    elif yellow_pct > yellow_threshold:
         state = 'yellow'
-    elif green_pct > 0.10:
+    elif green_pct > green_threshold:
         state = 'green'
     else:
-        # If no color is dominant enough, pick the highest.
-        max_pct = max(red_pct, yellow_pct, green_pct)
-        if max_pct == red_pct:
-            state = 'red'
-        elif max_pct == yellow_pct:
-            state = 'yellow'
+        # Fallback: if one color has clear absolute dominance in pixel count
+        # (useful for thin arm masks where background bleeds), prefer the
+        # color with the largest absolute pixels provided it has at least
+        # a couple pixels of evidence.
+        max_count = max(red_pixels, yellow_pixels, green_pixels)
+        if max_count >= max(2, min_colored_pixels):
+            if max_count == red_pixels:
+                state = 'red'
+            elif max_count == yellow_pixels:
+                state = 'yellow'
+            else:
+                state = 'green'
         else:
-            state = 'green'
+            # Last resort: pick the highest percentage
+            max_pct = max(red_pct, yellow_pct, green_pct)
+            if max_pct == red_pct:
+                state = 'red'
+            elif max_pct == yellow_pct:
+                state = 'yellow'
+            else:
+                state = 'green'
 
     dominant_pct = max(red_pct, yellow_pct, green_pct)
     pixel_strength = min(1.0, total_colored / max(float(min_colored_pixels * 2), 1.0))
@@ -295,30 +327,103 @@ def build_limb_template_masks(roi_w, roi_h):
     masks = {name: np.zeros((roi_h, roi_w), dtype=np.uint8) for name in ALL_LIMBS}
 
     def pt(xn, yn):
-        return (int(xn * roi_w), int(yn * roi_h))
+        # Apply global pixel shifts so templates can be quickly aligned
+        return (int(xn * roi_w) + TEMPLATE_SHIFT_X, int(yn * roi_h) + TEMPLATE_SHIFT_Y)
 
     line_thick = max(2, int(min(roi_w, roi_h) * 0.05))
     leg_thick = max(2, int(min(roi_w, roi_h) * 0.045))
     arm_thick = max(2, int(min(roi_w, roi_h) * 0.045))
+    # Apply extra leg thickness if configured
+    leg_thick = leg_thick + int(max(0, LEG_THICK_ADJUST))
 
-    # Head ring
-    cv2.circle(masks['head'], pt(0.50, 0.10), max(3, int(min(roi_w, roi_h) * 0.10)), 255, thickness=line_thick)
+    # Head ring (apply per-limb offset)
+    hx, hy = PER_LIMB_OFFSETS.get('head', (0, 0))
+    head_center = pt(0.50, 0.10)
+    head_center = (head_center[0] + hx, head_center[1] + hy)
+    cv2.circle(masks['head'], head_center, max(3, int(min(roi_w, roi_h) * 0.10)), 255, thickness=line_thick)
 
-    # Chest and torso are filled center regions
-    chest_poly = np.array([pt(0.36, 0.22), pt(0.64, 0.22), pt(0.66, 0.41), pt(0.34, 0.41)], dtype=np.int32)
-    torso_poly = np.array([pt(0.38, 0.40), pt(0.62, 0.40), pt(0.60, 0.58), pt(0.40, 0.58)], dtype=np.int32)
+    # Chest and torso are filled center regions (apply per-limb offsets)
+    cx_off, cy_off = PER_LIMB_OFFSETS.get('chest', (0, 0))
+    tx_off, ty_off = PER_LIMB_OFFSETS.get('torso', (0, 0))
+    # Build chest polygon as floats so we can scale it about its centroid
+    chest_poly = np.array([pt(0.36, 0.22), pt(0.64, 0.22), pt(0.66, 0.41), pt(0.34, 0.41)], dtype=np.float32)
+    # Shrink chest polygon toward its centroid by CHEST_SHRINK_PX (approx)
+    if CHEST_SHRINK_PX > 0:
+        xs = chest_poly[:, 0]
+        ys = chest_poly[:, 1]
+        w = xs.max() - xs.min()
+        h = ys.max() - ys.min()
+        max_dim = max(w, h, 1.0)
+        scale = max(0.0, 1.0 - (float(CHEST_SHRINK_PX) / float(max_dim)))
+        centroid = chest_poly.mean(axis=0)
+        chest_poly = (centroid + (chest_poly - centroid) * scale).astype(np.int32)
+    else:
+        chest_poly = chest_poly.astype(np.int32)
+    chest_poly = chest_poly + np.array([cx_off, cy_off], dtype=np.int32)
+
+    # Build torso polygon as floats so we can scale it about its centroid
+    torso_poly = np.array([pt(0.38, 0.40), pt(0.62, 0.40), pt(0.60, 0.58), pt(0.40, 0.58)], dtype=np.float32)
+    # Shrink torso polygon toward its centroid by TORSO_SHRINK_PX (approx)
+    if TORSO_SHRINK_PX > 0:
+        xs_t = torso_poly[:, 0]
+        ys_t = torso_poly[:, 1]
+        w_t = xs_t.max() - xs_t.min()
+        h_t = ys_t.max() - ys_t.min()
+        max_dim_t = max(w_t, h_t, 1.0)
+        scale_t = max(0.0, 1.0 - (float(TORSO_SHRINK_PX) / float(max_dim_t)))
+        centroid_t = torso_poly.mean(axis=0)
+        torso_poly = (centroid_t + (torso_poly - centroid_t) * scale_t).astype(np.int32)
+    else:
+        torso_poly = torso_poly.astype(np.int32)
+    torso_poly = torso_poly + np.array([tx_off, ty_off], dtype=np.int32)
     cv2.fillConvexPoly(masks['chest'], chest_poly, 255)
     cv2.fillConvexPoly(masks['torso'], torso_poly, 255)
 
-    # Arms as traced curves
+    # Arms as traced curves (apply per-limb offsets)
+    la_off = PER_LIMB_OFFSETS.get('left_arm', (0, 0))
+    ra_off = PER_LIMB_OFFSETS.get('right_arm', (0, 0))
     left_arm_pts = np.array([pt(0.32, 0.23), pt(0.24, 0.34), pt(0.20, 0.48), pt(0.24, 0.60)], dtype=np.int32)
     right_arm_pts = np.array([pt(0.68, 0.23), pt(0.76, 0.34), pt(0.80, 0.48), pt(0.76, 0.60)], dtype=np.int32)
+    left_arm_pts = left_arm_pts + np.array(la_off, dtype=np.int32)
+    right_arm_pts = right_arm_pts + np.array(ra_off, dtype=np.int32)
     cv2.polylines(masks['left_arm'], [left_arm_pts], False, 255, thickness=arm_thick)
     cv2.polylines(masks['right_arm'], [right_arm_pts], False, 255, thickness=arm_thick)
 
-    # Legs as traced lines
-    left_leg_pts = np.array([pt(0.45, 0.58), pt(0.38, 0.76), pt(0.32, 0.93)], dtype=np.int32)
-    right_leg_pts = np.array([pt(0.55, 0.58), pt(0.62, 0.76), pt(0.68, 0.93)], dtype=np.int32)
+    # Legs as traced lines (apply per-limb offsets)
+    ll_off = PER_LIMB_OFFSETS.get('left_leg', (0, 0))
+    rl_off = PER_LIMB_OFFSETS.get('right_leg', (0, 0))
+    # Legs as traced lines (apply per-limb offsets). Grow the leg shape about
+    # its centroid by LEG_GROW_PX to increase box/coverage.
+    left_leg_pts = np.array([pt(0.45, 0.58), pt(0.38, 0.76), pt(0.32, 0.93)], dtype=np.float32)
+    right_leg_pts = np.array([pt(0.55, 0.58), pt(0.62, 0.76), pt(0.68, 0.93)], dtype=np.float32)
+    # Grow left leg
+    if LEG_GROW_PX > 0:
+        xs = left_leg_pts[:, 0]
+        ys = left_leg_pts[:, 1]
+        w = xs.max() - xs.min()
+        h = ys.max() - ys.min()
+        max_dim = max(w, h, 1.0)
+        scale = 1.0 + (float(LEG_GROW_PX) / float(max_dim))
+        centroid = left_leg_pts.mean(axis=0)
+        left_leg_pts = (centroid + (left_leg_pts - centroid) * scale).astype(np.int32)
+    else:
+        left_leg_pts = left_leg_pts.astype(np.int32)
+
+    # Grow right leg
+    if LEG_GROW_PX > 0:
+        xsr = right_leg_pts[:, 0]
+        ysr = right_leg_pts[:, 1]
+        wr = xsr.max() - xsr.min()
+        hr = ysr.max() - ysr.min()
+        max_dim_r = max(wr, hr, 1.0)
+        scale_r = 1.0 + (float(LEG_GROW_PX) / float(max_dim_r))
+        centroid_r = right_leg_pts.mean(axis=0)
+        right_leg_pts = (centroid_r + (right_leg_pts - centroid_r) * scale_r).astype(np.int32)
+    else:
+        right_leg_pts = right_leg_pts.astype(np.int32)
+
+    left_leg_pts = left_leg_pts + np.array(ll_off, dtype=np.int32)
+    right_leg_pts = right_leg_pts + np.array(rl_off, dtype=np.int32)
     cv2.polylines(masks['left_leg'], [left_leg_pts], False, 255, thickness=leg_thick)
     cv2.polylines(masks['right_leg'], [right_leg_pts], False, 255, thickness=leg_thick)
 
@@ -393,23 +498,16 @@ def main():
             hsv_roi = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
             
             # Create separate masks for each color to avoid merging
-            # Use VERY HIGH saturation/value to ONLY detect bright player model colors
-            # This ignores shadows, background, and environmental interference
+            # Use very permissive ranges since the player model spans wide HSV range
             
-            # Green player parts (ONLY bright saturated green)
-            green_mask = cv2.inRange(hsv_roi, np.array([45, 80, 100]), np.array([85, 255, 255]))
+            # All colors - capture everything in the model
+            # This is intentionally broad to avoid missing any part
+            color_mask = cv2.inRange(hsv_roi, np.array([0, 0, 38]), np.array([180, 255, 255]))
             
-            # Yellow player parts (ONLY bright saturated yellow)
-            yellow_mask = cv2.inRange(hsv_roi, np.array([18, 80, 100]), np.array([44, 255, 255]))
-            
-            # Orange/Red player parts (strict mask for robust contour extraction in moving environments)
-            orange_mask = cv2.inRange(hsv_roi, np.array([5, 80, 100]), np.array([18, 255, 255]))
-            red_mask1 = cv2.inRange(hsv_roi, np.array([0, 80, 100]), np.array([5, 255, 255]))
-            red_mask2 = cv2.inRange(hsv_roi, np.array([170, 80, 100]), np.array([180, 255, 255]))
-            red_mask = cv2.bitwise_or(cv2.bitwise_or(orange_mask, red_mask1), red_mask2)
-            
-            # Combine all player model colors
-            color_mask = cv2.bitwise_or(cv2.bitwise_or(green_mask, yellow_mask), red_mask)
+            # Debug: print pixel count for first frame
+            if not debug_image_saved:
+                c_cnt = cv2.countNonZero(color_mask)
+                print(f"DEBUG: Total colored pixels: {c_cnt}")
             
             # Remove noise - very gentle to preserve limb shapes
             kernel = np.ones((2, 2), np.uint8)
@@ -455,7 +553,9 @@ def main():
             for limb_name in ALL_LIMBS:
                 limb_mask = template_masks[limb_name]
                 mask_pixels = cv2.countNonZero(limb_mask)
-                min_pixels = max(3, int(mask_pixels * TEMPLATE_MASK_MIN_PIXELS_RATIO))
+                # Be permissive for small masks (arms/hands) while keeping
+                # a sensible minimum for larger masks.
+                min_pixels = max(2, int(mask_pixels * TEMPLATE_MASK_MIN_PIXELS_RATIO))
                 profile = 'core_relaxed' if limb_name in CORE_LIMBS else 'strict'
                 limb_analysis = analyze_color_state(
                     roi_frame,
@@ -470,8 +570,11 @@ def main():
                     current_states[limb_name] = limb_state
                     frame_signal_conf[limb_name] = limb_conf
                     limbs_ever_seen.add(limb_name)
-                elif DEBUG_MODE:
-                    print(f"  {limb_name}: {limb_state} (conf: {limb_conf:.2f}, colored: {limb_analysis['total_colored']})")
+                else:
+                    # Print debug info for unknown/missing limbs to diagnose detection
+                    print(f"  {limb_name}: {limb_state} (conf: {limb_conf:.2f}, colored: {limb_analysis['total_colored']}, "
+                          f"green%: {limb_analysis['green_pct']:.3f}, yellow%: {limb_analysis['yellow_pct']:.3f}, "
+                          f"red%: {limb_analysis['red_pct']:.3f}, coverage: {limb_analysis['coverage_ratio']:.3f})")
             
             # Update detection history for temporal smoothing
             for limb_name in ALL_LIMBS:
