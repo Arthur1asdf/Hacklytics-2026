@@ -156,15 +156,16 @@ def analyze_color_state(roi_section, mask=None, min_colored_pixels=3, profile='s
         hsv = cv2.bitwise_and(hsv, hsv, mask=mask)
     
     # Define color ranges for classification
+    # All require minimum saturation (80) to avoid environmental interference
     # Green: hue 40-90
-    green_mask = cv2.inRange(hsv, np.array([40, 0, 38]), np.array([90, 255, 255]))
+    green_mask = cv2.inRange(hsv, np.array([40, 80, 38]), np.array([90, 255, 255]))
     
     # Yellow: hue 15-45
-    yellow_mask = cv2.inRange(hsv, np.array([15, 0, 38]), np.array([45, 255, 255]))
+    yellow_mask = cv2.inRange(hsv, np.array([15, 80, 38]), np.array([45, 255, 255]))
     
     # Red: hue 0-15 and 160-180
-    red_mask1 = cv2.inRange(hsv, np.array([0, 0, 38]), np.array([15, 255, 255]))
-    red_mask2 = cv2.inRange(hsv, np.array([160, 0, 38]), np.array([180, 255, 255]))
+    red_mask1 = cv2.inRange(hsv, np.array([0, 80, 38]), np.array([15, 255, 255]))
+    red_mask2 = cv2.inRange(hsv, np.array([160, 80, 38]), np.array([180, 255, 255]))
     red_mask = cv2.bitwise_or(red_mask1, red_mask2)
     
     # Count pixels for each color
@@ -498,11 +499,12 @@ def main():
             hsv_roi = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2HSV)
             
             # Create separate masks for each color to avoid merging
-            # Use very permissive ranges since the player model spans wide HSV range
+            # Use permissive hue range but require HIGH saturation to avoid
+            # picking up environmental light interference (yellowing light, etc)
             
             # All colors - capture everything in the model
-            # This is intentionally broad to avoid missing any part
-            color_mask = cv2.inRange(hsv_roi, np.array([0, 0, 38]), np.array([180, 255, 255]))
+            # Require minimum saturation (80) to distinguish from washed-out environmental light
+            color_mask = cv2.inRange(hsv_roi, np.array([0, 80, 38]), np.array([180, 255, 255]))
             
             # Debug: print pixel count for first frame
             if not debug_image_saved:
