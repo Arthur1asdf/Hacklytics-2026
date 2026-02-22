@@ -21,10 +21,10 @@ ADJUST_ROI_MODE = False  # Set to True to position the box interactively
 # ============================================================
 # ADJUST THESE VALUES FOR YOUR SCREEN/RESOLUTION  
 # ============================================================
-ROI_X = 52
-ROI_Y = 135
-ROI_WIDTH = 115
-ROI_HEIGHT = 269
+ROI_X = 45
+ROI_Y = 35
+ROI_WIDTH = 150
+ROI_HEIGHT = 365
 
 # ROI adjustment controls
 MOVE_STEP = 5       # Pixels to move per keypress

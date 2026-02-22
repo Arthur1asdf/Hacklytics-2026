@@ -205,9 +205,8 @@ if __name__ == "__main__":
         print("  4. Re-run this script")
     else:
         # Set these to match your ROI dimensions from cvopen.py
-        TARGET_WIDTH = 115
-        TARGET_HEIGHT = 269
-        
+        TARGET_WIDTH = 150
+        TARGET_HEIGHT = 365
         masks = create_limb_templates_from_image(
             'player_reference.png',
             TARGET_WIDTH,
